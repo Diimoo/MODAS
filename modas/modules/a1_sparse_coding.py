@@ -44,7 +44,7 @@ class A1SparseCoding(nn.Module):
         sample_rate: int = 16000,
         n_fft: int = 512,
         hop_length: int = 160,
-        lambda_sparse: float = 0.1,
+        lambda_sparse: float = 0.5,
         tau: float = 10.0,
         eta: float = 0.01,
         meta_beta: float = 0.999,
@@ -340,8 +340,8 @@ class A1SparseCoding(nn.Module):
             self.spec_std = momentum * self.spec_std + (1 - momentum) * batch_std
     
     def get_sparsity(self, codes: torch.Tensor, threshold: float = 0.01) -> float:
-        """Compute activation sparsity."""
-        return (codes.abs() > threshold).float().mean().item()
+        """Compute activation sparsity (fraction of INACTIVE units). Higher = sparser."""
+        return (codes.abs() <= threshold).float().mean().item()
     
     def get_effective_capacity(self, threshold: float = 0.01) -> float:
         """Compute effective capacity."""

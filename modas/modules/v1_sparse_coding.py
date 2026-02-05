@@ -40,7 +40,7 @@ class V1SparseCoding(nn.Module):
         n_bases: int = 128,
         patch_size: int = 16,
         n_channels: int = 3,
-        lambda_sparse: float = 0.1,
+        lambda_sparse: float = 0.5,
         tau: float = 10.0,
         eta: float = 0.01,
         meta_beta: float = 0.999,
@@ -117,7 +117,8 @@ class V1SparseCoding(nn.Module):
         # Feed-forward drive: b = D @ x
         b = patch @ self.dictionary.T  # (batch, n_bases)
         
-        # Recurrent dynamics
+        # Recurrent dynamics with stable time step
+        dt = 0.1  # Small time step for stability
         for _ in range(self.lca_iterations):
             # Soft threshold to get activities
             a = F.softshrink(u, lambd=self.lambda_sparse)
@@ -125,9 +126,9 @@ class V1SparseCoding(nn.Module):
             # Lateral inhibition
             inhibition = a @ self.gram_matrix  # (batch, n_bases)
             
-            # Update membrane potential
+            # Update membrane potential (stable integration)
             du = (b - u - inhibition) / self.tau
-            u = u + du
+            u = u + dt * du
         
         # Final activities
         activities = F.softshrink(u, lambd=self.lambda_sparse)
@@ -310,8 +311,8 @@ class V1SparseCoding(nn.Module):
         return mse
     
     def get_sparsity(self, codes: torch.Tensor, threshold: float = 0.01) -> float:
-        """Compute activation sparsity (fraction of active units)."""
-        return (codes.abs() > threshold).float().mean().item()
+        """Compute activation sparsity (fraction of INACTIVE units). Higher = sparser."""
+        return (codes.abs() <= threshold).float().mean().item()
     
     def get_effective_capacity(self, threshold: float = 0.01) -> float:
         """Compute effective capacity (fraction of used bases)."""

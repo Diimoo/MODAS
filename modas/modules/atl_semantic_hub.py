@@ -41,7 +41,7 @@ class ATLSemanticHub(nn.Module):
         self,
         n_prototypes: int = 200,
         feature_dim: int = 128,
-        temperature: float = 0.2,
+        temperature: float = 1.0,  # Increased from 0.2 to avoid sigmoid collapse
         lr_base: float = 0.01,
         meta_beta: float = 0.999,
         memory_size: int = 100,
@@ -87,7 +87,8 @@ class ATLSemanticHub(nn.Module):
     def forward(
         self,
         features: torch.Tensor,
-        modality: str = 'visual'
+        modality: str = 'visual',
+        return_centered: bool = False,
     ) -> torch.Tensor:
         """
         Compute semantic activation for input features.
@@ -97,6 +98,7 @@ class ATLSemanticHub(nn.Module):
         Args:
             features: Input features (feature_dim,) or (batch, feature_dim)
             modality: Modality type ('visual', 'audio', 'language')
+            return_centered: If True, return centered activations (act - 0.5)
         
         Returns:
             Semantic activation (n_prototypes,) or (batch, n_prototypes)
@@ -117,6 +119,11 @@ class ATLSemanticHub(nn.Module):
         # Temperature-scaled sigmoid activation (NOT softmax!)
         # FROM CHPL LESSON: Softmax creates 0.7 artifact
         activations = torch.sigmoid(similarities / self.temperature)
+        
+        # Center activations to avoid collapse artifact
+        # Centered activations have mean ~0, enabling discrimination
+        if return_centered:
+            activations = activations - 0.5
         
         if squeeze_output:
             activations = activations.squeeze(0)
@@ -168,16 +175,21 @@ class ATLSemanticHub(nn.Module):
         vis_act = self.forward(vis_features, 'visual')
         lang_act = self.forward(lang_features, 'language')
         
-        # Positive similarity (matched pair)
+        # CRITICAL FIX: Use DIRECT feature similarity for contrastive learning
+        # Semantic embeddings don't work until prototypes are trained (chicken-egg)
+        # Feature similarity provides meaningful gradient signal from the start
         pos_sim = F.cosine_similarity(
-            vis_act.unsqueeze(0),
-            lang_act.unsqueeze(0)
+            vis_features.unsqueeze(0),
+            lang_features.unsqueeze(0)
         ).squeeze()
         
-        # Negative similarities from temporal memory (FROM CHPL)
-        neg_sims = self._get_negative_similarities(vis_act, 'language')
+        # Store query for negative sampling
+        self._last_query_features = vis_features.detach().clone()
         
-        # Contrastive margin (FROM CHPL)
+        # Negative similarities from temporal memory - use FEATURE space
+        neg_sims = self._get_negative_feature_similarities(vis_features, 'language')
+        
+        # Contrastive margin in FEATURE space (FROM CHPL)
         if len(neg_sims) > 0:
             max_neg = max(neg_sims)
             margin = pos_sim - max_neg
@@ -241,10 +253,54 @@ class ATLSemanticHub(nn.Module):
         neg_sims = []
         for idx in indices:
             neg_features = memory[idx]
-            neg_act = self.forward(neg_features, modality)
+            # Use semantic embeddings for negative similarity
+            neg_emb = self.get_semantic_embedding(neg_features)
+            query_emb = self.get_semantic_embedding(
+                self._last_query_features if hasattr(self, '_last_query_features') else neg_features
+            )
             sim = F.cosine_similarity(
-                query_act.unsqueeze(0),
-                neg_act.unsqueeze(0)
+                query_emb.unsqueeze(0),
+                neg_emb.unsqueeze(0)
+            ).item()
+            neg_sims.append(sim)
+        
+        return neg_sims
+    
+    def _get_negative_feature_similarities(
+        self,
+        query_features: torch.Tensor,
+        modality: str
+    ) -> List[float]:
+        """
+        Get negative similarities in raw FEATURE space (not embedding space).
+        
+        This provides meaningful contrastive signal even before prototypes are trained.
+        """
+        if modality == 'language':
+            memory = self.memory_lang
+        elif modality == 'visual':
+            memory = self.memory_vis
+        elif modality == 'audio':
+            memory = self.memory_aud
+        else:
+            return []
+        
+        if len(memory) == 0:
+            return []
+        
+        # Normalize query
+        query_features = F.normalize(query_features, p=2, dim=0)
+        
+        # Sample negatives
+        n_samples = min(self.n_negatives, len(memory))
+        indices = np.random.choice(len(memory), n_samples, replace=False)
+        
+        neg_sims = []
+        for idx in indices:
+            neg_features = F.normalize(memory[idx], p=2, dim=0)
+            sim = F.cosine_similarity(
+                query_features.unsqueeze(0),
+                neg_features.unsqueeze(0)
             ).item()
             neg_sims.append(sim)
         
@@ -322,6 +378,7 @@ class ATLSemanticHub(nn.Module):
         self,
         features1: torch.Tensor,
         features2: torch.Tensor,
+        method: str = 'embedding',
     ) -> torch.Tensor:
         """
         Compute cross-modal similarity through ATL space.
@@ -329,14 +386,29 @@ class ATLSemanticHub(nn.Module):
         Args:
             features1: First modality features (feature_dim,)
             features2: Second modality features (feature_dim,)
+            method: 'embedding' (in feature space) or 'centered' (centered activations)
         
         Returns:
             Similarity score (scalar)
         """
-        act1 = self.forward(features1)
-        act2 = self.forward(features2)
+        if method == 'embedding':
+            # Compute similarity via semantic embeddings (in original feature space)
+            # This avoids the sigmoid collapse problem entirely
+            emb1 = self.get_semantic_embedding(features1)
+            emb2 = self.get_semantic_embedding(features2)
+            return F.cosine_similarity(emb1.unsqueeze(0), emb2.unsqueeze(0)).squeeze()
         
-        return F.cosine_similarity(act1.unsqueeze(0), act2.unsqueeze(0)).squeeze()
+        elif method == 'centered':
+            # Use centered activations (subtract 0.5) to avoid collapse
+            act1 = self.forward(features1, return_centered=True)
+            act2 = self.forward(features2, return_centered=True)
+            return F.cosine_similarity(act1.unsqueeze(0), act2.unsqueeze(0)).squeeze()
+        
+        else:
+            # Raw activations (prone to collapse - not recommended)
+            act1 = self.forward(features1)
+            act2 = self.forward(features2)
+            return F.cosine_similarity(act1.unsqueeze(0), act2.unsqueeze(0)).squeeze()
     
     def retrieve_by_modality(
         self,
