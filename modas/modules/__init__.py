@@ -7,15 +7,17 @@ MODAS Neural Modules
 - ATLSemanticHub: Cross-modal binding via Contrastive Hebbian Learning
 """
 
-from modas.modules.v1_sparse_coding import V1SparseCoding
-from modas.modules.a1_sparse_coding import A1SparseCoding
-from modas.modules.language_encoder import LanguageEncoder, HebbianLanguageEncoder
-from modas.modules.atl_semantic_hub import ATLSemanticHub
+from .v1_sparse_coding import V1SparseCoding
+from .a1_sparse_coding import A1SparseCoding
+from .language_encoder import LanguageEncoder, HebbianLanguageEncoder
+from .atl_semantic_hub import ATLSemanticHub
+from .atl_semantic_hub_v2 import ATLSemanticHubV2
 
 __all__ = [
-    "V1SparseCoding",
-    "A1SparseCoding",
-    "LanguageEncoder",
-    "HebbianLanguageEncoder",
-    "ATLSemanticHub",
+    'V1SparseCoding',
+    'A1SparseCoding', 
+    'LanguageEncoder',
+    'HebbianLanguageEncoder',
+    'ATLSemanticHub',
+    'ATLSemanticHubV2',
 ]
