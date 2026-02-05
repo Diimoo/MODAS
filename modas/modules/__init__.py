@@ -12,6 +12,7 @@ from .a1_sparse_coding import A1SparseCoding
 from .language_encoder import LanguageEncoder, HebbianLanguageEncoder
 from .atl_semantic_hub import ATLSemanticHub
 from .atl_semantic_hub_v2 import ATLSemanticHubV2
+from .atl_semantic_hub_v3 import ATLSemanticHubV3
 
 __all__ = [
     'V1SparseCoding',
@@ -20,4 +21,5 @@ __all__ = [
     'HebbianLanguageEncoder',
     'ATLSemanticHub',
     'ATLSemanticHubV2',
+    'ATLSemanticHubV3',
 ]
