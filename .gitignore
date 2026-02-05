@@ -53,3 +53,7 @@ wandb/
 # OS
 .DS_Store
 Thumbs.db
+
+# Reference projects (not part of MODAS, for inspiration only)
+MBM/
+CHPL/
