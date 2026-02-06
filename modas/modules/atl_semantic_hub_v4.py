@@ -122,6 +122,53 @@ class HebbianProjectionV4(nn.Module):
             
             self.weight.add_(delta)
             self.weight.clamp_(-2.0, 2.0)
+    
+    def hebbian_update_batch(
+        self,
+        input_features: torch.Tensor,
+        teaching_signal: torch.Tensor,
+        self_output: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        """
+        Batched Hebbian update — averages over valid samples in batch.
+        
+        Args:
+            input_features: (batch, input_dim)
+            teaching_signal: (batch, output_dim)
+            self_output: (batch, output_dim)
+            mask: (batch,) bool — which samples pass margin threshold
+        """
+        if mask.sum() == 0:
+            return
+        
+        with torch.no_grad():
+            x = input_features[mask]         # (N, input_dim)
+            y_other = teaching_signal[mask]   # (N, output_dim)
+            y_self = self_output[mask]        # (N, output_dim)
+            N = x.shape[0]
+            
+            # Update running mean
+            self.n_updates += N
+            batch_mean = y_self.mean(dim=0)
+            self.running_mean = (
+                self.momentum * self.running_mean +
+                (1 - self.momentum) * batch_mean
+            )
+            
+            # Batched outer products, averaged
+            attract = (y_other.T @ x) / N           # (output_dim, input_dim)
+            repel = torch.outer(self.running_mean, x.mean(dim=0))
+            decay = ((y_other ** 2).mean(dim=0).unsqueeze(1)) * self.weight
+            
+            delta = (
+                self.lr_attract * attract
+                - self.lr_repel * repel
+                - self.lr_attract * decay
+            )
+            
+            self.weight.add_(delta)
+            self.weight.clamp_(-2.0, 2.0)
 
 
 class ATLSemanticHubV4(nn.Module):
@@ -268,7 +315,7 @@ class ATLSemanticHubV4(nn.Module):
         audio_features: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Cross-modal binding with collapse prevention.
+        Cross-modal binding with collapse prevention (single sample).
         """
         vis_features = F.normalize(vis_features, p=2, dim=-1)
         lang_features = F.normalize(lang_features, p=2, dim=-1)
@@ -303,20 +350,7 @@ class ATLSemanticHubV4(nn.Module):
         
         # Prototype update (only on positive margin)
         if margin.item() > self.margin_threshold:
-            avg_act = (self.get_activation(vis_proj_new) + self.get_activation(lang_proj_new)) / 2
-            avg_proj = F.normalize((vis_proj_new + lang_proj_new) / 2, dim=-1)
-            
-            with torch.no_grad():
-                for i in range(self.n_prototypes):
-                    act = avg_act[i].item()
-                    if act > 0.01:
-                        lr = self.prototype_lr[i].item()
-                        delta = lr * act * (avg_proj - self.prototypes[i])
-                        self.prototypes[i] = F.normalize(
-                            self.prototypes[i] + delta, dim=-1
-                        )
-                        self.usage_count[i] += act
-                        self.prototype_lr[i] *= 0.9999
+            self._update_prototypes(vis_proj_new, lang_proj_new)
         
         # Store in memory
         self.memory_vis.append(vis_proj_new.detach().clone())
@@ -331,6 +365,139 @@ class ATLSemanticHubV4(nn.Module):
             self.collapse_metric_history.append(self.compute_collapse_metric())
         
         return pos_sim, margin
+    
+    def bind_batch(
+        self,
+        vis_features: torch.Tensor,
+        lang_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Fully vectorized cross-modal binding — no Python loops.
+        
+        Args:
+            vis_features: (batch, feature_dim)
+            lang_features: (batch, feature_dim)
+        Returns:
+            (pos_sim, margin) averaged over batch
+        """
+        B = vis_features.shape[0]
+        vis_features = F.normalize(vis_features, p=2, dim=-1)
+        lang_features = F.normalize(lang_features, p=2, dim=-1)
+        
+        # Project
+        vis_proj = self.proj_visual(vis_features)    # (B, shared_dim)
+        lang_proj = self.proj_language(lang_features) # (B, shared_dim)
+        
+        # Per-sample positive similarity
+        pos_sims = F.cosine_similarity(vis_proj, lang_proj, dim=1)  # (B,)
+        
+        # Contrastive margin via in-batch negatives
+        sim_matrix = vis_proj @ lang_proj.T  # (B, B)
+        mask_diag = ~torch.eye(B, dtype=torch.bool, device=vis_features.device)
+        neg_sims = sim_matrix.masked_fill(~mask_diag, -1e9)
+        max_neg, _ = neg_sims.max(dim=1)  # (B,)
+        margins = pos_sims - max_neg       # (B,)
+        
+        # Threshold mask
+        update_mask = margins > self.margin_threshold  # (B,)
+        
+        # Batched Hebbian updates on projections
+        self.proj_visual.hebbian_update_batch(
+            input_features=vis_features,
+            teaching_signal=lang_proj.detach(),
+            self_output=vis_proj.detach(),
+            mask=update_mask,
+        )
+        self.proj_language.hebbian_update_batch(
+            input_features=lang_features,
+            teaching_signal=vis_proj.detach(),
+            self_output=lang_proj.detach(),
+            mask=update_mask,
+        )
+        
+        # Re-project and update prototypes (fully vectorized)
+        vis_proj_new = self.proj_visual(vis_features)
+        lang_proj_new = self.proj_language(lang_features)
+        self._update_prototypes_batch(vis_proj_new, lang_proj_new, update_mask)
+        
+        self.training_step += B
+        
+        return pos_sims.mean(), margins.mean()
+    
+    def _update_prototypes_batch(
+        self,
+        vis_proj: torch.Tensor,
+        lang_proj: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        """
+        Fully vectorized prototype update over a batch.
+        
+        Args:
+            vis_proj: (B, shared_dim)
+            lang_proj: (B, shared_dim)
+            mask: (B,) bool — valid samples
+        """
+        if mask.sum() == 0:
+            return
+        
+        with torch.no_grad():
+            v = vis_proj[mask]   # (N, shared_dim)
+            l = lang_proj[mask]  # (N, shared_dim)
+            
+            # Average projected representation per sample
+            avg_proj = F.normalize((v + l) / 2, dim=-1)  # (N, shared_dim)
+            
+            # Activations: (N, n_prototypes)
+            vis_act = F.softmax((v @ self.prototypes.T) / self.temperature, dim=1)
+            lang_act = F.softmax((l @ self.prototypes.T) / self.temperature, dim=1)
+            avg_act = (vis_act + lang_act) / 2  # (N, n_prototypes)
+            
+            # Zero out sub-threshold activations
+            avg_act = avg_act * (avg_act > 0.01).float()
+            
+            # Weighted sum of projected representations per prototype
+            # weight_sum[p] = sum_n avg_act[n, p]
+            weight_sum = avg_act.sum(dim=0)  # (n_prototypes,)
+            # weighted_proj[p] = sum_n avg_act[n, p] * avg_proj[n]
+            weighted_proj = avg_act.T @ avg_proj  # (n_prototypes, shared_dim)
+            
+            # Only update prototypes that received activation
+            active = weight_sum > 0.01
+            if active.any():
+                lr = self.prototype_lr[active]  # (A,)
+                w = weight_sum[active]          # (A,)
+                target = weighted_proj[active] / w.unsqueeze(1)  # (A, shared_dim)
+                
+                # Hebbian-like update: move toward weighted average of projections
+                scale = (lr * w).unsqueeze(1)  # (A, 1)
+                delta = scale * (target - self.prototypes[active])
+                self.prototypes[active] = F.normalize(
+                    self.prototypes[active] + delta, dim=-1
+                )
+                self.usage_count[active] += w
+                self.prototype_lr[active] *= 0.9999
+    
+    def _update_prototypes(
+        self,
+        vis_proj: torch.Tensor,
+        lang_proj: torch.Tensor,
+    ):
+        """Update prototypes from a single projected pair (for single-sample bind)."""
+        avg_act = (self.get_activation(vis_proj) + self.get_activation(lang_proj)) / 2
+        avg_proj = F.normalize((vis_proj + lang_proj) / 2, dim=-1)
+        
+        with torch.no_grad():
+            active = (avg_act > 0.01).nonzero(as_tuple=True)[0]
+            for i in active:
+                act = avg_act[i]
+                lr = self.prototype_lr[i]
+                delta = lr * act * (avg_proj - self.prototypes[i])
+                self.prototypes[i] = F.normalize(
+                    self.prototypes[i] + delta, dim=-1
+                )
+                self.usage_count[i] += act
+                self.prototype_lr[i] *= 0.9999
     
     def forward(self, features: torch.Tensor, modality: str = 'visual') -> torch.Tensor:
         """Semantic activation."""
